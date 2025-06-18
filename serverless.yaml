@@ -71,6 +71,16 @@ provider:
             StringEquals:
               ses:FromAddress: ${self:provider.environment.EMAIL_FROM}
 
+package:
+  exclude:
+    - ec2-scripts/**
+    - .git/**
+    - .gitignore
+    - README.md
+    - .DS_Store
+    - node_modules/**
+    - .serverless/**
+
 functions:
   # 1. Input Validator - Triggered by S3
   inputValidator:
