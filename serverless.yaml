@@ -18,7 +18,7 @@ provider:
     KEY_NAME: hebrew-transcription-key
     # AMI IDs by region (to be populated after AMI creation)
     AMI_ID_US_EAST_1: ${env:AMI_ID_US_EAST_1, 'ami-placeholder'}
-    AMI_ID_US_WEST_2: ${env:AMI_ID_US_WEST_2, 'ami-placeholder'}
+    AMI_ID_US_WEST_2: ${env:AMI_ID_US_WEST_2, 'ami-04a45969db684fdd1'}
     AMI_ID_AP_SOUTHEAST_2: ${env:AMI_ID_AP_SOUTHEAST_2, 'ami-placeholder'}
     # Email configuration
     EMAIL_RECIPIENTS: michael@squarepeg.vc,roy@squarepeg.vc,jordan@squarepeg.vc
