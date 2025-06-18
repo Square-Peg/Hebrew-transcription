@@ -1,0 +1,459 @@
+service: hebrew-transcription-pipeline
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  stackName: hebrew-transcription-${self:provider.stage}
+  memorySize: 1024
+  timeout: 60
+  environment:
+    STAGE: ${self:provider.stage}
+    S3_BUCKET: hebrew-transcription-bucket-${self:provider.stage}
+    STATE_MACHINE_ARN: !Ref TranscriptionStateMachine
+    DYNAMODB_TABLE: hebrew-transcription-state-${self:provider.stage}
+    # Instance configuration
+    INSTANCE_TYPE: g5.xlarge
+    KEY_NAME: hebrew-transcription-key
+    # AMI IDs by region (to be populated after AMI creation)
+    AMI_ID_US_EAST_1: ${env:AMI_ID_US_EAST_1, 'ami-placeholder'}
+    AMI_ID_US_WEST_2: ${env:AMI_ID_US_WEST_2, 'ami-placeholder'}
+    AMI_ID_AP_SOUTHEAST_2: ${env:AMI_ID_AP_SOUTHEAST_2, 'ami-placeholder'}
+    # Email configuration
+    EMAIL_RECIPIENTS: michael@squarepeg.vc,roy@squarepeg.vc,jordan@squarepeg.vc
+    EMAIL_FROM: hebrew-transcription@squarepeg.vc
+    # Models configuration
+    WHISPER_MODEL: ivrit-ai/whisper-large-v3-ct2
+    TRANSLATION_MODEL: Helsinki-NLP/opus-mt-tc-big-he-en
+
+  iam:
+    role:
+      statements:
+        # S3 permissions
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:ListBucket
+          Resource:
+            - arn:aws:s3:::${self:provider.environment.S3_BUCKET}
+            - arn:aws:s3:::${self:provider.environment.S3_BUCKET}/*
+        
+        # DynamoDB permissions
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt StateTable.Arn
+            - !Sub "${StateTable.Arn}/index/*"
+        
+        # Step Functions permissions
+        - Effect: Allow
+          Action:
+            - states:StartExecution
+            - states:DescribeExecution
+            - states:StopExecution
+          Resource:
+            - !Ref TranscriptionStateMachine
+        
+        # SES permissions
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource: '*'
+          Condition:
+            StringEquals:
+              ses:FromAddress: ${self:provider.environment.EMAIL_FROM}
+
+functions:
+  # 1. Input Validator - Triggered by S3
+  inputValidator:
+    handler: src/handlers/inputValidator.handler
+    timeout: 30
+    events:
+      - s3:
+          bucket: ${self:provider.environment.S3_BUCKET}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: raw/
+            - suffix: .mp3
+      - s3:
+          bucket: ${self:provider.environment.S3_BUCKET}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: raw/
+            - suffix: .wav
+      - s3:
+          bucket: ${self:provider.environment.S3_BUCKET}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: raw/
+            - suffix: .m4a
+
+  # 2. Instance Manager - Launches EC2
+  instanceManager:
+    handler: src/handlers/instanceManager.handler
+    timeout: 300
+    environment:
+      SECURITY_GROUP_ID_US_EAST_1: !Ref SecurityGroupUSEast1
+      SECURITY_GROUP_ID_US_WEST_2: !Ref SecurityGroupUSWest2
+      SECURITY_GROUP_ID_AP_SOUTHEAST_2: !Ref SecurityGroupAPSoutheast2
+      IAM_INSTANCE_PROFILE: !Ref EC2InstanceProfile
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - ec2:RunInstances
+          - ec2:CreateTags
+          - ec2:DescribeInstances
+          - ec2:DescribeInstanceStatus
+          - ec2:TerminateInstances
+          - ec2:DescribeVpcs
+          - ec2:DescribeSubnets
+          - ec2:DescribeSecurityGroups
+          - ec2:DescribeSpotInstanceRequests
+          - ec2:RequestSpotInstances
+          - ec2:CancelSpotInstanceRequests
+        Resource: '*'
+      - Effect: Allow
+        Action:
+          - iam:PassRole
+        Resource: !GetAtt EC2Role.Arn
+
+  # 3. Status Monitor - Polls for completion
+  statusMonitor:
+    handler: src/handlers/statusMonitor.handler
+    timeout: 60
+
+  # 4. Email Sender - Sends results
+  emailSender:
+    handler: src/handlers/emailSender.handler
+    timeout: 120
+    environment:
+      MAX_ATTACHMENT_SIZE: 10485760  # 10MB
+
+  # 5. Cleanup Handler - Post-processing
+  cleanupHandler:
+    handler: src/handlers/cleanupHandler.handler
+    timeout: 60
+
+  # 6. Error Handler - Handles failures
+  errorHandler:
+    handler: src/handlers/errorHandler.handler
+    timeout: 60
+
+stepFunctions:
+  stateMachines:
+    transcriptionPipeline:
+      name: hebrew-transcription-${self:provider.stage}
+      definition:
+        Comment: "Hebrew audio transcription pipeline"
+        StartAt: ValidateInput
+        States:
+          ValidateInput:
+            Type: Task
+            Resource: !GetAtt InputValidatorLambdaFunction.Arn
+            ResultPath: $.validation
+            Next: CheckExistingInstance
+            Retry:
+              - ErrorEquals: ["States.TaskFailed"]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: HandleError
+                ResultPath: $.error
+
+          CheckExistingInstance:
+            Type: Task
+            Resource: !GetAtt InstanceManagerLambdaFunction.Arn
+            Parameters:
+              action: "check"
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+            ResultPath: $.instanceCheck
+            Next: InstanceDecision
+
+          InstanceDecision:
+            Type: Choice
+            Choices:
+              - Variable: $.instanceCheck.hasRunning
+                BooleanEquals: true
+                Next: WaitForProcessing
+            Default: LaunchInstance
+
+          LaunchInstance:
+            Type: Task
+            Resource: !GetAtt InstanceManagerLambdaFunction.Arn
+            Parameters:
+              action: "launch"
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              validation.$: $.validation
+            ResultPath: $.instance
+            Next: WaitForProcessing
+            Retry:
+              - ErrorEquals: ["InsufficientInstanceCapacity"]
+                IntervalSeconds: 300
+                MaxAttempts: 12
+                BackoffRate: 1
+              - ErrorEquals: ["States.TaskFailed"]
+                IntervalSeconds: 30
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: HandleError
+                ResultPath: $.error
+
+          WaitForProcessing:
+            Type: Wait
+            Seconds: 60
+            Next: CheckProgress
+
+          CheckProgress:
+            Type: Task
+            Resource: !GetAtt StatusMonitorLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              instanceId.$: $.instance.instanceId
+            ResultPath: $.status
+            Next: ProcessingComplete?
+
+          ProcessingComplete?:
+            Type: Choice
+            Choices:
+              - Variable: $.status.isComplete
+                BooleanEquals: true
+                Next: SendEmail
+              - Variable: $.status.isFailed
+                BooleanEquals: true
+                Next: HandleError
+              - Variable: $.status.elapsedMinutes
+                NumericGreaterThan: 120
+                Next: HandleTimeout
+            Default: WaitForProcessing
+
+          SendEmail:
+            Type: Task
+            Resource: !GetAtt EmailSenderLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              outputKey.$: $.status.outputKey
+              transcriptKey.$: $.status.transcriptKey
+              processingTime.$: $.status.processingTime
+            ResultPath: $.email
+            Next: Cleanup
+            Retry:
+              - ErrorEquals: ["States.TaskFailed"]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: Cleanup
+                ResultPath: $.emailError
+
+          Cleanup:
+            Type: Task
+            Resource: !GetAtt CleanupHandlerLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              success: true
+            End: true
+
+          HandleError:
+            Type: Task
+            Resource: !GetAtt ErrorHandlerLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              error.$: $.error
+            Next: CleanupError
+
+          HandleTimeout:
+            Type: Task
+            Resource: !GetAtt ErrorHandlerLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              error:
+                Cause: "Processing timeout exceeded"
+                Error: "ProcessingTimeout"
+            Next: CleanupError
+
+          CleanupError:
+            Type: Task
+            Resource: !GetAtt CleanupHandlerLambdaFunction.Arn
+            Parameters:
+              s3Key.$: $.s3Key
+              s3Bucket.$: $.s3Bucket
+              success: false
+            End: true
+
+resources:
+  Resources:
+    # S3 Bucket
+    TranscriptionBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.S3_BUCKET}
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteErrorFiles
+              Status: Enabled
+              ExpirationInDays: 30
+              Prefix: error/
+            - Id: DeleteOldOutputs
+              Status: Enabled
+              ExpirationInDays: 90
+              Prefix: outputs/
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    # DynamoDB Table for state tracking
+    StateTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: filename
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+          - AttributeName: status
+            AttributeType: S
+        KeySchema:
+          - AttributeName: filename
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: status-timestamp-index
+            KeySchema:
+              - AttributeName: status
+                KeyType: HASH
+              - AttributeName: timestamp
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+
+    # EC2 Instance Profile and Role
+    EC2Role:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: hebrew-transcription-ec2-${self:provider.stage}
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: ec2.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        Policies:
+          - PolicyName: S3Access
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource:
+                    - arn:aws:s3:::${self:provider.environment.S3_BUCKET}/*
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource:
+                    - arn:aws:s3:::${self:provider.environment.S3_BUCKET}
+
+    EC2InstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        InstanceProfileName: hebrew-transcription-profile-${self:provider.stage}
+        Roles:
+          - !Ref EC2Role
+
+    # Security Groups for each region
+    SecurityGroupUSEast1:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupName: hebrew-transcription-${self:provider.stage}-us-east-1
+        GroupDescription: Security group for Hebrew transcription EC2 instances
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0  # Restrict this in production
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    SecurityGroupUSWest2:
+      Type: AWS::EC2::SecurityGroup
+      Condition: CreateUSWest2Resources
+      Properties:
+        GroupName: hebrew-transcription-${self:provider.stage}-us-west-2
+        GroupDescription: Security group for Hebrew transcription EC2 instances
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    SecurityGroupAPSoutheast2:
+      Type: AWS::EC2::SecurityGroup
+      Condition: CreateAPSoutheast2Resources
+      Properties:
+        GroupName: hebrew-transcription-${self:provider.stage}-ap-southeast-2
+        GroupDescription: Security group for Hebrew transcription EC2 instances
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+  Conditions:
+    CreateUSWest2Resources: !Equals [${opt:multi-region, 'false'}, 'true']
+    CreateAPSoutheast2Resources: !Equals [${opt:multi-region, 'false'}, 'true']
+
+  Outputs:
+    BucketName:
+      Value: !Ref TranscriptionBucket
+      Export:
+        Name: ${self:provider.stackName}-bucket
+    
+    StateMachineArn:
+      Value: !Ref TranscriptionStateMachine
+      Export:
+        Name: ${self:provider.stackName}-state-machine
+    
+    SecurityGroupUSEast1:
+      Value: !Ref SecurityGroupUSEast1
+      Export:
+        Name: ${self:provider.stackName}-sg-us-east-1
