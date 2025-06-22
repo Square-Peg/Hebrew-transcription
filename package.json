@@ -1,35 +1,25 @@
 {
     "name": "hebrew-transcription-pipeline",
     "version": "1.0.0",
-    "description": "Hebrew to English audio transcription pipeline on AWS",
-    "main": "index.js",
     "scripts": {
-      "deploy": "serverless deploy",
-      "deploy:prod": "serverless deploy --stage prod",
-      "remove": "serverless remove",
-      "logs": "serverless logs -f",
-      "test": "jest",
-      "lint": "eslint src/"
+        "deploy": "serverless deploy",
+        "deploy:prod": "serverless deploy --stage prod",
+        "remove": "serverless remove"
     },
     "dependencies": {
-      "@aws-sdk/client-dynamodb": "^3.478.0",
-      "@aws-sdk/client-ec2": "^3.478.0",
-      "@aws-sdk/client-s3": "^3.478.0",
-      "@aws-sdk/client-ses": "^3.478.0",
-      "@aws-sdk/client-stepfunctions": "^3.478.0",
-      "@aws-sdk/lib-dynamodb": "^3.478.0",
-      "uuid": "^9.0.1"
+        "@aws-sdk/client-dynamodb": "^3.478.0",
+        "@aws-sdk/client-ec2": "^3.478.0",
+        "@aws-sdk/client-s3": "^3.478.0",
+        "@aws-sdk/client-ses": "^3.478.0",
+        "@aws-sdk/client-sfn": "^3.478.0",
+        "@aws-sdk/client-ssm": "^3.830.0",
+        "@aws-sdk/lib-dynamodb": "^3.478.0",
+        "@aws-sdk/s3-request-presigner": "^3.478.0",
+        "uuid": "^9.0.1"
     },
     "devDependencies": {
-      "eslint": "^8.56.0",
-      "jest": "^29.7.0",
-      "serverless": "^3.38.0",
-      "serverless-iam-roles-per-function": "^3.2.0",
-      "serverless-step-functions": "^3.19.0"
-    },
-    "author": "SquarePeg",
-    "license": "MIT",
-    "engines": {
-      "node": ">=18.0.0"
+        "serverless": "^3.38.0",
+        "serverless-iam-roles-per-function": "^3.2.0",
+        "serverless-step-functions": "^3.19.0"
     }
-  }
+}

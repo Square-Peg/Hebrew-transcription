@@ -3,7 +3,7 @@ const { S3Client, CopyObjectCommand, DeleteObjectCommand } = require('@aws-sdk/c
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand, GetCommand } = require('@aws-sdk/lib-dynamodb');
 
-const sesClient = new SESClient({ region: 'us-east-1' });
+const sesClient = new SESClient({ region: process.env.SES_REGION || 'us-east-1' });
 const s3Client = new S3Client({});
 const dynamoClient = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
@@ -46,7 +46,7 @@ async function moveFileToError(bucket, key) {
 /**
  * Get error details from various sources
  */
-async function getErrorDetails(error, filename) {
+async function getErrorDetails(error, id, filename) {
   const errorInfo = {
     message: 'Unknown error',
     type: 'Unknown',
@@ -79,7 +79,7 @@ async function getErrorDetails(error, filename) {
   try {
     const dbResult = await docClient.send(new GetCommand({
       TableName: process.env.DYNAMODB_TABLE,
-      Key: { filename }
+      Key: { id }
     }));
     
     if (dbResult.Item) {
@@ -212,12 +212,12 @@ This is an automated error notification from the Hebrew Transcription Pipeline.`
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
   
-  const { s3Key, s3Bucket, error } = event;
+  const { id, s3Key, s3Bucket, error } = event;
   const filename = s3Key?.split('/').pop() || 'unknown';
   
   try {
     // Get comprehensive error details
-    const errorInfo = await getErrorDetails(error, filename);
+    const errorInfo = await getErrorDetails(error, id, filename);
     console.log('Error details:', errorInfo);
     
     // Move file to error folder
@@ -252,7 +252,7 @@ exports.handler = async (event) => {
     
     await docClient.send(new UpdateCommand({
       TableName: process.env.DYNAMODB_TABLE,
-      Key: { filename },
+      Key: { id },
       UpdateExpression: `SET ${updateExpressions.join(', ')}`,
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues

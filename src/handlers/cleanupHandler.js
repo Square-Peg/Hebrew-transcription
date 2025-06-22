@@ -65,7 +65,6 @@ async function terminateInstance(instanceId, region) {
  * Clean up any orphaned instances for this audio file
  */
 async function cleanupOrphanedInstances(filename) {
-  const filenameHash = require('crypto').createHash('md5').update(filename).digest('hex').substring(0, 8);
   const results = [];
   
   for (const region of REGIONS) {
@@ -109,7 +108,7 @@ async function cleanupOrphanedInstances(filename) {
 /**
  * Update final status in DynamoDB
  */
-async function updateFinalStatus(filename, success, additionalData = {}) {
+async function updateFinalStatus(id, success, additionalData = {}) {
   const timestamp = new Date().toISOString();
   
   const updates = {
@@ -132,7 +131,7 @@ async function updateFinalStatus(filename, success, additionalData = {}) {
   
   await docClient.send(new UpdateCommand({
     TableName: process.env.DYNAMODB_TABLE,
-    Key: { filename },
+    Key: { id },
     UpdateExpression: `SET ${updateExpressions.join(', ')}`,
     ExpressionAttributeNames: expressionAttributeNames,
     ExpressionAttributeValues: expressionAttributeValues
@@ -145,7 +144,7 @@ async function updateFinalStatus(filename, success, additionalData = {}) {
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
   
-  const { s3Key, s3Bucket, success, instanceId, region } = event;
+  const { id, s3Key, success, instanceId, region } = event;
   const filename = s3Key.split('/').pop();
   
   try {
@@ -172,7 +171,7 @@ exports.handler = async (event) => {
     cleanupResults.orphanedInstancesCleaned = orphanedResults;
     
     // Update final status in DynamoDB
-    await updateFinalStatus(filename, success, {
+    await updateFinalStatus(id, success, {
       cleanupResults: JSON.stringify(cleanupResults)
     });
     
@@ -194,7 +193,7 @@ exports.handler = async (event) => {
     
     // Try to update DynamoDB even if cleanup fails
     try {
-      await updateFinalStatus(filename, false, {
+      await updateFinalStatus(id, false, {
         cleanupError: error.message
       });
     } catch (dbError) {

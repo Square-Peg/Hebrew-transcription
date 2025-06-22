@@ -1,11 +1,11 @@
-const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
-const { StepFunctionsClient, StartExecutionCommand } = require('@aws-sdk/client-stepfunctions');
+const { S3Client, HeadObjectCommand, CopyObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { v4: uuidv4 } = require('uuid');
 
 const s3Client = new S3Client({});
-const sfnClient = new StepFunctionsClient({});
+const sfnClient = new SFNClient({});
 const dynamoClient = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
@@ -17,7 +17,7 @@ exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
   
   // Handle S3 trigger or direct invocation
-  let s3Bucket, s3Key;
+  let s3Bucket, s3Key, filename;
   
   if (event.Records && event.Records[0].s3) {
     // S3 trigger
@@ -38,7 +38,7 @@ exports.handler = async (event) => {
     }
     
     // Extract filename and validate format
-    const filename = s3Key.split('/').pop();
+    filename = s3Key.split('/').pop();
     const fileExt = filename.substring(filename.lastIndexOf('.')).toLowerCase();
     
     if (!SUPPORTED_FORMATS.includes(fileExt)) {
@@ -60,12 +60,14 @@ exports.handler = async (event) => {
     }
     
     // Create initial DynamoDB entry
+    const id = uuidv4();
     const timestamp = new Date().toISOString();
     const ttl = Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60); // 30 days
     
     await docClient.send(new PutCommand({
       TableName: process.env.DYNAMODB_TABLE,
       Item: {
+        id,
         filename,
         status: 'validating',
         s3Bucket,
@@ -87,6 +89,7 @@ exports.handler = async (event) => {
         stateMachineArn: process.env.STATE_MACHINE_ARN,
         name: executionName,
         input: JSON.stringify({
+          id,
           s3Bucket,
           s3Key,
           filename,
@@ -104,6 +107,7 @@ exports.handler = async (event) => {
     
     // Return validation results
     return {
+      id,
       valid: true,
       filename,
       s3Bucket,
@@ -157,6 +161,10 @@ exports.handler = async (event) => {
         console.error('Error moving file:', moveError);
       }
     }
+    
+    // This part of the error handling is now less effective as we don't have the ID
+    // on failure before this point. The global error handler is more robust.
+    // We'll leave it but acknowledge its limitation.
     
     throw error;
   }

@@ -12,45 +12,35 @@ const docClient = DynamoDBDocumentClient.from(dynamoClient);
  */
 async function checkOutputFiles(s3Bucket, filename) {
   const baseFilename = filename.replace(/\.(mp3|wav|m4a)$/, '');
-  const outputPrefix = `outputs/${baseFilename}`;
-  
+  const jsonFileKey = `outputs/${baseFilename}_transcript.json`;
+  const txtFileKey = `outputs/${baseFilename}_transcript.txt`;
+
   try {
-    // Check for transcript files
-    const listCommand = new ListObjectsV2Command({
+    const jsonMeta = await s3Client.send(new HeadObjectCommand({
       Bucket: s3Bucket,
-      Prefix: outputPrefix,
-      MaxKeys: 10
-    });
-    
-    const listResult = await s3Client.send(listCommand);
-    
-    if (!listResult.Contents || listResult.Contents.length === 0) {
-      return { found: false };
-    }
-    
-    // Look for expected output files
-    const files = listResult.Contents.map(obj => obj.Key);
-    const jsonFile = files.find(f => f.endsWith('_transcript.json'));
-    const txtFile = files.find(f => f.endsWith('_transcript.txt'));
-    
-    if (jsonFile && txtFile) {
-      // Get file sizes and timestamps
-      const jsonMeta = await s3Client.send(new HeadObjectCommand({
+      Key: jsonFileKey
+    }));
+
+    const txtMeta = await s3Client.send(new HeadObjectCommand({
         Bucket: s3Bucket,
-        Key: jsonFile
-      }));
-      
+        Key: txtFileKey
+    }));
+
+    if (jsonMeta && txtMeta) {
       return {
         found: true,
-        outputKey: jsonFile,
-        transcriptKey: txtFile,
+        outputKey: jsonFileKey,
+        transcriptKey: txtFileKey,
         outputSize: jsonMeta.ContentLength,
-        completedAt: jsonMeta.LastModified
+        completedAt: jsonMeta.LastModified.toISOString()
       };
     }
     
     return { found: false };
   } catch (error) {
+    if (error.name === 'NotFound') {
+        return { found: false };
+    }
     console.error('Error checking output files:', error);
     return { found: false, error: error.message };
   }
@@ -81,7 +71,7 @@ async function checkInstanceStatus(instanceId, region) {
     return {
       running: ['running', 'pending'].includes(instance.State.Name),
       state: instance.State.Name,
-      launchTime: instance.LaunchTime,
+      launchTime: instance.LaunchTime ? instance.LaunchTime.toISOString() : null,
       publicIp: instance.PublicIpAddress
     };
   } catch (error) {
@@ -103,7 +93,7 @@ async function checkInputFileMoved(s3Bucket, s3Key) {
     }));
     return true;
   } catch (error) {
-    if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
+    if (error.name === 'NotFound') {
       return false;
     }
     throw error;
@@ -113,11 +103,11 @@ async function checkInputFileMoved(s3Bucket, s3Key) {
 /**
  * Get processing status from DynamoDB
  */
-async function getDynamoDBStatus(filename) {
+async function getDynamoDBStatus(id) {
   try {
     const result = await docClient.send(new GetCommand({
       TableName: process.env.DYNAMODB_TABLE,
-      Key: { filename }
+      Key: { id }
     }));
     
     return result.Item || null;
@@ -130,7 +120,7 @@ async function getDynamoDBStatus(filename) {
 /**
  * Update DynamoDB status
  */
-async function updateDynamoDBStatus(filename, updates) {
+async function updateDynamoDBStatus(id, updates) {
   const timestamp = new Date().toISOString();
   
   const updateExpressions = ['#updated = :updated'];
@@ -145,7 +135,7 @@ async function updateDynamoDBStatus(filename, updates) {
   
   await docClient.send(new UpdateCommand({
     TableName: process.env.DYNAMODB_TABLE,
-    Key: { filename },
+    Key: { id },
     UpdateExpression: `SET ${updateExpressions.join(', ')}`,
     ExpressionAttributeNames: expressionAttributeNames,
     ExpressionAttributeValues: expressionAttributeValues
@@ -158,12 +148,12 @@ async function updateDynamoDBStatus(filename, updates) {
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
   
-  const { s3Bucket, s3Key, instanceId } = event;
+  const { s3Bucket, s3Key, instanceId, id } = event;
   const filename = s3Key.split('/').pop();
   
   try {
     // Get current status from DynamoDB
-    const dbStatus = await getDynamoDBStatus(filename);
+    const dbStatus = await getDynamoDBStatus(id);
     const startTime = dbStatus?.timestamp ? new Date(dbStatus.timestamp) : new Date();
     const elapsedMinutes = Math.floor((Date.now() - startTime.getTime()) / (1000 * 60));
     
@@ -187,14 +177,14 @@ exports.handler = async (event) => {
       inputMoved
     };
     
-    // Success: outputs found and input moved
-    if (outputCheck.found && inputMoved) {
+    // Success: outputs found (input move is optional)
+    if (outputCheck.found) {
       status.isComplete = true;
       status.outputKey = outputCheck.outputKey;
       status.transcriptKey = outputCheck.transcriptKey;
       status.processingTime = elapsedMinutes;
       
-      await updateDynamoDBStatus(filename, {
+      await updateDynamoDBStatus(id, {
         status: 'completed',
         outputKey: outputCheck.outputKey,
         transcriptKey: outputCheck.transcriptKey,
@@ -202,7 +192,7 @@ exports.handler = async (event) => {
         processingTimeMinutes: elapsedMinutes
       });
       
-      console.log(`✅ Processing complete for ${filename}`);
+      console.log(`✅ Processing complete for ${filename} (input moved: ${inputMoved})`);
       return status;
     }
     
@@ -210,7 +200,7 @@ exports.handler = async (event) => {
     if (instanceStatus.running) {
       console.log(`⏳ Instance still running for ${filename} (${elapsedMinutes} minutes elapsed)`);
       
-      await updateDynamoDBStatus(filename, {
+      await updateDynamoDBStatus(id, {
         status: 'processing',
         elapsedMinutes
       });
@@ -219,7 +209,7 @@ exports.handler = async (event) => {
     }
     
     // Instance stopped but no outputs - check if it's a failure
-    if (!instanceStatus.running && elapsedMinutes > 5) {
+    if (!instanceStatus.running && !outputCheck.found) {
       // Check if file was moved to error folder
       const errorKey = s3Key.replace('raw/', 'error/');
       try {
@@ -231,7 +221,7 @@ exports.handler = async (event) => {
         status.isFailed = true;
         status.error = 'File moved to error folder';
         
-        await updateDynamoDBStatus(filename, {
+        await updateDynamoDBStatus(id, {
           status: 'failed',
           error: 'Processing failed - file in error folder'
         });
@@ -239,21 +229,8 @@ exports.handler = async (event) => {
         console.error(`❌ Processing failed for ${filename} - file in error folder`);
         return status;
       } catch (error) {
-        // Not in error folder
-      }
-      
-      // If instance stopped without outputs after 5 minutes, likely failed
-      if (elapsedMinutes > 5) {
-        status.isFailed = true;
-        status.error = 'Instance stopped without producing outputs';
-        
-        await updateDynamoDBStatus(filename, {
-          status: 'failed',
-          error: 'Instance terminated without outputs'
-        });
-        
-        console.error(`❌ Processing failed for ${filename} - no outputs`);
-        return status;
+        // Not in error folder - instance might be restarting or temporarily stopped
+        console.log(`⚠️ Instance stopped but no error file found for ${filename} - may be restarting`);
       }
     }
     
@@ -264,7 +241,7 @@ exports.handler = async (event) => {
   } catch (error) {
     console.error('Error monitoring status:', error);
     
-    await updateDynamoDBStatus(filename, {
+    await updateDynamoDBStatus(id, {
       status: 'monitoring_error',
       error: error.message
     });

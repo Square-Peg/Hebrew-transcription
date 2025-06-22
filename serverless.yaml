@@ -1,5 +1,9 @@
 service: hebrew-transcription-pipeline
 
+plugins:
+  - serverless-step-functions
+  - serverless-iam-roles-per-function
+
 provider:
   name: aws
   runtime: nodejs18.x
@@ -10,22 +14,27 @@ provider:
   timeout: 60
   environment:
     STAGE: ${self:provider.stage}
-    S3_BUCKET: hebrew-transcription-bucket-${self:provider.stage}
-    STATE_MACHINE_ARN: !Ref TranscriptionStateMachine
+    S3_BUCKET: hebrew-transcription-9999-${self:provider.stage}
+    STATE_MACHINE_ARN: arn:aws:states:${self:provider.region}:${aws:accountId}:stateMachine:hebrew-transcription-${self:provider.stage}
     DYNAMODB_TABLE: hebrew-transcription-state-${self:provider.stage}
     # Instance configuration
-    INSTANCE_TYPE: g5.xlarge
-    KEY_NAME: hebrew-transcription-key
+    INSTANCE_TYPE: ${env:INSTANCE_TYPE, 'g5.xlarge'}
+    KEY_NAME: ${env:KEY_NAME, 'hebrew-transcription-key'}
     # AMI IDs by region (to be populated after AMI creation)
-    AMI_ID_US_EAST_1: ${env:AMI_ID_US_EAST_1, 'ami-placeholder'}
-    AMI_ID_US_WEST_2: ${env:AMI_ID_US_WEST_2, 'ami-04a45969db684fdd1'}
-    AMI_ID_AP_SOUTHEAST_2: ${env:AMI_ID_AP_SOUTHEAST_2, 'ami-placeholder'}
+    AMI_ID_US_EAST_1: ${env:AMI_ID_US_EAST_1, 'ami-06b2065cbd2730ac9'}
+    AMI_ID_US_WEST_2: ${env:AMI_ID_US_WEST_2, 'ami-0e60d436d747a8994'}
+    AMI_ID_AP_SOUTHEAST_2: ${env:AMI_ID_AP_SOUTHEAST_2, 'ami-0defd8953acfdab29'}
     # Email configuration
-    EMAIL_RECIPIENTS: michael@squarepeg.vc,roy@squarepeg.vc,jordan@squarepeg.vc
-    EMAIL_FROM: hebrew-transcription@squarepeg.vc
+    EMAIL_RECIPIENTS: ${env:EMAIL_RECIPIENTS, 'michael@squarepeg.vc,roy@squarepeg.vc,jordan@squarepeg.vc'}
+    EMAIL_FROM: ${env:EMAIL_FROM, 'michael@squarepeg.vc'}
+    SES_REGION: ${env:SES_REGION, 'us-east-1'}
     # Models configuration
-    WHISPER_MODEL: ivrit-ai/whisper-large-v3-ct2
-    TRANSLATION_MODEL: Helsinki-NLP/opus-mt-tc-big-he-en
+    WHISPER_MODEL: ${env:WHISPER_MODEL, 'ivrit-ai/whisper-large-v3-ct2'}
+    TRANSLATION_MODEL: ${env:TRANSLATION_MODEL, 'Helsinki-NLP/opus-mt-tc-big-he-en'}
+    # AI Summary configuration
+    AI_PROVIDER: ${env:AI_PROVIDER, 'openai'} # 'claude' or 'openai'
+    AI_API_KEY: ${env:AI_API_KEY, ''}
+    AI_API_KEY_SSM: '/hebrew-transcription/openai-api-key' # SSM parameter name for API key
 
   iam:
     role:
@@ -59,7 +68,7 @@ provider:
             - states:DescribeExecution
             - states:StopExecution
           Resource:
-            - !Ref TranscriptionStateMachine
+            - ${self:provider.environment.STATE_MACHINE_ARN}
         
         # SES permissions
         - Effect: Allow
@@ -78,7 +87,6 @@ package:
     - .gitignore
     - README.md
     - .DS_Store
-    - node_modules/**
     - .serverless/**
 
 functions:
@@ -90,18 +98,21 @@ functions:
       - s3:
           bucket: ${self:provider.environment.S3_BUCKET}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: raw/
             - suffix: .mp3
       - s3:
           bucket: ${self:provider.environment.S3_BUCKET}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: raw/
             - suffix: .wav
       - s3:
           bucket: ${self:provider.environment.S3_BUCKET}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: raw/
             - suffix: .m4a
@@ -111,9 +122,6 @@ functions:
     handler: src/handlers/instanceManager.handler
     timeout: 300
     environment:
-      SECURITY_GROUP_ID_US_EAST_1: !Ref SecurityGroupUSEast1
-      SECURITY_GROUP_ID_US_WEST_2: !Ref SecurityGroupUSWest2
-      SECURITY_GROUP_ID_AP_SOUTHEAST_2: !Ref SecurityGroupAPSoutheast2
       IAM_INSTANCE_PROFILE: !Ref EC2InstanceProfile
     iamRoleStatements:
       - Effect: Allow
@@ -134,6 +142,16 @@ functions:
         Action:
           - iam:PassRole
         Resource: !GetAtt EC2Role.Arn
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          - dynamodb:Query
+        Resource:
+          - !GetAtt StateTable.Arn
+          - !Sub "${StateTable.Arn}/index/*"
 
   # 3. Status Monitor - Polls for completion
   statusMonitor:
@@ -143,9 +161,34 @@ functions:
   # 4. Email Sender - Sends results
   emailSender:
     handler: src/handlers/emailSender.handler
-    timeout: 120
+    timeout: 180  # Increased for AI API calls
     environment:
       MAX_ATTACHMENT_SIZE: 10485760  # 10MB
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - ssm:GetParameter
+          - ssm:GetParametersByPath
+        Resource:
+          - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource:
+          - !GetAtt StateTable.Arn
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+        Resource:
+          - arn:aws:s3:::${self:provider.environment.S3_BUCKET}/*
+      - Effect: Allow
+        Action:
+          - ses:SendEmail
+          - ses:SendRawEmail
+        Resource: '*'
+        Condition:
+          StringEquals:
+            ses:FromAddress: ${self:provider.environment.EMAIL_FROM}
 
   # 5. Cleanup Handler - Post-processing
   cleanupHandler:
@@ -185,6 +228,7 @@ stepFunctions:
             Resource: !GetAtt InstanceManagerLambdaFunction.Arn
             Parameters:
               action: "check"
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
             ResultPath: $.instanceCheck
@@ -195,19 +239,29 @@ stepFunctions:
             Choices:
               - Variable: $.instanceCheck.hasRunning
                 BooleanEquals: true
-                Next: WaitForProcessing
+                Next: NormalizeInstanceState
             Default: LaunchInstance
+
+          NormalizeInstanceState:
+            Type: Pass
+            Parameters:
+              instanceId.$: "$.instanceCheck.instances[0].instanceId"
+              region.$: "$.instanceCheck.region"
+              type: "pre-existing"
+            ResultPath: "$.instance"
+            Next: WaitForProcessing
 
           LaunchInstance:
             Type: Task
             Resource: !GetAtt InstanceManagerLambdaFunction.Arn
             Parameters:
               action: "launch"
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
               validation.$: $.validation
-            ResultPath: $.instance
-            Next: WaitForProcessing
+            ResultPath: $.launchResult
+            Next: NormalizeLaunchResult
             Retry:
               - ErrorEquals: ["InsufficientInstanceCapacity"]
                 IntervalSeconds: 300
@@ -222,6 +276,35 @@ stepFunctions:
                 Next: HandleError
                 ResultPath: $.error
 
+          NormalizeLaunchResult:
+            Type: Choice
+            Choices:
+              - Variable: $.launchResult.instanceId
+                IsPresent: true
+                Next: SetLaunchInstance
+              - Variable: $.launchResult.hasRunning
+                BooleanEquals: true
+                Next: ExtractSkippedInstance
+            Default: HandleError
+
+          ExtractSkippedInstance:
+            Type: Pass
+            Parameters:
+              instanceId.$: "$.launchResult.instances[0].instanceId"
+              region.$: "$.launchResult.region"
+              type: "pre-existing-skipped"
+            ResultPath: "$.instance"
+            Next: WaitForProcessing
+
+          SetLaunchInstance:
+            Type: Pass
+            Parameters:
+              instanceId.$: "$.launchResult.instanceId"
+              region.$: "$.launchResult.region"
+              type.$: "$.launchResult.type"
+            ResultPath: "$.instance"
+            Next: WaitForProcessing
+
           WaitForProcessing:
             Type: Wait
             Seconds: 60
@@ -231,6 +314,7 @@ stepFunctions:
             Type: Task
             Resource: !GetAtt StatusMonitorLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
               instanceId.$: $.instance.instanceId
@@ -245,16 +329,25 @@ stepFunctions:
                 Next: SendEmail
               - Variable: $.status.isFailed
                 BooleanEquals: true
-                Next: HandleError
+                Next: PrepareError
               - Variable: $.status.elapsedMinutes
-                NumericGreaterThan: 120
+                NumericGreaterThan: 1440  # 24 hours - for very large files
                 Next: HandleTimeout
             Default: WaitForProcessing
+
+          PrepareError:
+            Type: Pass
+            Parameters:
+              Cause.$: $.status.error
+              Error: "ProcessingFailed"
+            ResultPath: $.error
+            Next: HandleError
 
           SendEmail:
             Type: Task
             Resource: !GetAtt EmailSenderLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
               outputKey.$: $.status.outputKey
@@ -276,8 +369,11 @@ stepFunctions:
             Type: Task
             Resource: !GetAtt CleanupHandlerLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
+              instanceId.$: $.instance.instanceId
+              region.$: $.instance.region
               success: true
             End: true
 
@@ -285,6 +381,7 @@ stepFunctions:
             Type: Task
             Resource: !GetAtt ErrorHandlerLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
               error.$: $.error
@@ -294,6 +391,7 @@ stepFunctions:
             Type: Task
             Resource: !GetAtt ErrorHandlerLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
               error:
@@ -305,8 +403,11 @@ stepFunctions:
             Type: Task
             Resource: !GetAtt CleanupHandlerLambdaFunction.Arn
             Parameters:
+              id.$: $.id
               s3Key.$: $.s3Key
               s3Bucket.$: $.s3Bucket
+              instanceId.$: $.instance.instanceId
+              region.$: $.instance.region
               success: false
             End: true
 
@@ -340,14 +441,14 @@ resources:
         TableName: ${self:provider.environment.DYNAMODB_TABLE}
         BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
-          - AttributeName: filename
-            AttributeType: S
-          - AttributeName: timestamp
+          - AttributeName: id
             AttributeType: S
           - AttributeName: status
             AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
         KeySchema:
-          - AttributeName: filename
+          - AttributeName: id
             KeyType: HASH
         GlobalSecondaryIndexes:
           - IndexName: status-timestamp-index
@@ -413,9 +514,6 @@ resources:
           - IpProtocol: tcp
             FromPort: 22
             ToPort: 22
-            CidrIp: 0.0.0.0/0  # Restrict this in production
-        SecurityGroupEgress:
-          - IpProtocol: -1
             CidrIp: 0.0.0.0/0
 
     SecurityGroupUSWest2:
@@ -429,9 +527,6 @@ resources:
             FromPort: 22
             ToPort: 22
             CidrIp: 0.0.0.0/0
-        SecurityGroupEgress:
-          - IpProtocol: -1
-            CidrIp: 0.0.0.0/0
 
     SecurityGroupAPSoutheast2:
       Type: AWS::EC2::SecurityGroup
@@ -444,26 +539,13 @@ resources:
             FromPort: 22
             ToPort: 22
             CidrIp: 0.0.0.0/0
-        SecurityGroupEgress:
-          - IpProtocol: -1
-            CidrIp: 0.0.0.0/0
 
   Conditions:
-    CreateUSWest2Resources: !Equals [${opt:multi-region, 'false'}, 'true']
-    CreateAPSoutheast2Resources: !Equals [${opt:multi-region, 'false'}, 'true']
+    CreateUSWest2Resources: !Equals [ "${self:provider.stage}", "prod" ]
+    CreateAPSoutheast2Resources: !Equals [ "${self:provider.stage}", "prod" ]
 
   Outputs:
     BucketName:
       Value: !Ref TranscriptionBucket
       Export:
         Name: ${self:provider.stackName}-bucket
-    
-    StateMachineArn:
-      Value: !Ref TranscriptionStateMachine
-      Export:
-        Name: ${self:provider.stackName}-state-machine
-    
-    SecurityGroupUSEast1:
-      Value: !Ref SecurityGroupUSEast1
-      Export:
-        Name: ${self:provider.stackName}-sg-us-east-1
