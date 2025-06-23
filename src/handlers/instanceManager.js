@@ -341,8 +341,8 @@ sudo shutdown -h now
  */
 async function waitForSpotInstance(ec2Client, spotInstanceRequestId) {
   // Monitor spot request (wait for fulfillment or timeout)
-  const maxWaitTime = 3 * 60 * 1000; // 3 minutes (reduced from 5 to allow on-demand fallback)
-  const pollInterval = 10000; // 10 seconds
+  const maxWaitTime = 15 * 1000; // 15 seconds
+  const pollInterval = 5000; // 5 seconds
   const startTime = Date.now();
 
   while (Date.now() - startTime < maxWaitTime) {
@@ -365,7 +365,7 @@ async function waitForSpotInstance(ec2Client, spotInstanceRequestId) {
     await new Promise(resolve => setTimeout(resolve, pollInterval));
   }
   
-  console.error(`Spot request ${spotInstanceRequestId} timed out after 3 minutes.`);
+  console.error(`Spot request ${spotInstanceRequestId} timed out after 15 seconds.`);
   return null;
 }
 

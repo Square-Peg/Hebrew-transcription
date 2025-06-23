@@ -10,7 +10,7 @@ const dynamoClient = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 // Supported audio formats
-const SUPPORTED_FORMATS = ['.mp3', '.wav', '.m4a'];
+const SUPPORTED_FORMATS = ['.mp3', '.wav', '.m4a', '.mp4'];
 const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024; // 5GB
 
 exports.handler = async (event) => {

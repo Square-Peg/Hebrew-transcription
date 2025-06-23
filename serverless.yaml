@@ -116,6 +116,13 @@ functions:
           rules:
             - prefix: raw/
             - suffix: .m4a
+      - s3:
+        bucket: ${self:provider.environment.S3_BUCKET}
+        event: s3:ObjectCreated:*
+        existing: true
+        rules:
+          - prefix: raw/
+          - suffix: .mp4
 
   # 2. Instance Manager - Launches EC2
   instanceManager:
