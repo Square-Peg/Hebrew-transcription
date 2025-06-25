@@ -117,12 +117,12 @@ functions:
             - prefix: raw/
             - suffix: .m4a
       - s3:
-        bucket: ${self:provider.environment.S3_BUCKET}
-        event: s3:ObjectCreated:*
-        existing: true
-        rules:
-          - prefix: raw/
-          - suffix: .mp4
+          bucket: ${self:provider.environment.S3_BUCKET}
+          event: s3:ObjectCreated:*
+          existing: true
+          rules:
+            - prefix: raw/
+            - suffix: .mp4
 
   # 2. Instance Manager - Launches EC2
   instanceManager:
@@ -206,6 +206,34 @@ functions:
   errorHandler:
     handler: src/handlers/errorHandler.handler
     timeout: 60
+
+  # Hebrew Audio Upload URL Generator
+  hebrewAudioUploadUrl:
+    handler: src/handlers/hebrewAudioUploadUrl.handler
+    memorySize: 512
+    timeout: 30
+    description: Generate pre-signed URLs for Hebrew audio uploads from Audio Hijack
+    environment:
+      S3_BUCKET: ${self:provider.environment.S3_BUCKET}
+    events:
+      - http:
+          path: /hebrew-audio/upload-url
+          method: POST
+          cors: true
+          private: true  # This requires API key
+      - http:
+          path: /hebrew-audio/upload-url
+          method: OPTIONS
+          cors: true
+    iamRoleStatementsName: hebrew-audio-upload-${self:provider.stage}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+          - s3:PutObjectAcl
+          - s3:PutObjectTagging
+        Resource:
+          - arn:aws:s3:::${self:provider.environment.S3_BUCKET}/raw/*
 
 stepFunctions:
   stateMachines:
@@ -547,6 +575,43 @@ resources:
             ToPort: 22
             CidrIp: 0.0.0.0/0
 
+    # API Key for Hebrew Audio Uploads
+    HebrewAudioUploadApiKey:
+      Type: AWS::ApiGateway::ApiKey
+      DependsOn: ApiGatewayDeployment${sls:instanceId}
+      Properties:
+        Name: hebrew-audio-upload-key-${self:provider.stage}
+        Description: API key for Hebrew audio uploads from Audio Hijack
+        Enabled: true
+        StageKeys:
+          - RestApiId: !Ref ApiGatewayRestApi
+            StageName: ${self:provider.stage}
+    
+    # Usage Plan for Hebrew Audio Uploads
+    HebrewAudioUploadUsagePlan:
+      Type: AWS::ApiGateway::UsagePlan
+      DependsOn: ApiGatewayDeployment${sls:instanceId}
+      Properties:
+        UsagePlanName: hebrew-audio-upload-plan-${self:provider.stage}
+        Description: Usage plan for Hebrew audio uploads
+        ApiStages:
+          - ApiId: !Ref ApiGatewayRestApi
+            Stage: ${self:provider.stage}
+        Throttle:
+          BurstLimit: 100      # Max requests in a burst
+          RateLimit: 50        # Requests per second
+        Quota:
+          Limit: 10000         # Requests per day
+          Period: DAY
+    
+    # Link API Key to Usage Plan
+    HebrewAudioUploadUsagePlanKey:
+      Type: AWS::ApiGateway::UsagePlanKey
+      Properties:
+        KeyId: !Ref HebrewAudioUploadApiKey
+        KeyType: API_KEY
+        UsagePlanId: !Ref HebrewAudioUploadUsagePlan
+
   Conditions:
     CreateUSWest2Resources: !Equals [ "${self:provider.stage}", "prod" ]
     CreateAPSoutheast2Resources: !Equals [ "${self:provider.stage}", "prod" ]
@@ -556,3 +621,9 @@ resources:
       Value: !Ref TranscriptionBucket
       Export:
         Name: ${self:provider.stackName}-bucket
+    
+    HebrewAudioUploadApiUrl:
+      Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}/hebrew-audio/upload-url'
+      Description: API endpoint for Hebrew audio upload URL generation
+      Export:
+        Name: ${self:provider.stackName}-hebrew-audio-upload-url
