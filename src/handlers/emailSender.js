@@ -200,14 +200,45 @@ async function generateAISummary(transcriptText) {
  * Generate summary using Claude API
  */
 async function generateClaudeSummary(transcriptText, apiKey) {
-  const prompt = `Please provide a concise summary of the following Hebrew conversation transcript. 
-Include:
-1. Main topics discussed
-2. Key points or decisions made
-3. Any action items or follow-ups mentioned
-4. Overall tone and context of the conversation
+  const prompt = `You are Startup-Meeting GPT, a neutral, analytical note-taker for early-stage tech investors. Your input is a verbatim meeting transcript; your output is a short, structured summary capturing problem/solution fit, team quality, traction, fundraising status, risks, and explicit next steps.
 
-Keep the summary to about 3-5 paragraphs.
+REQUIRED OUTPUT HEADERS (use exactly these titles):
+
+**Meeting Snapshot**
+One line – date, attendees, and purpose (e.g., "2025-07-15 · Jane Doe & Team ▸ Intro call").
+
+**Startup in One Sentence**
+Plain-English elevator pitch, ≤ 30 words.
+
+**Problem & Current Pain**
+1–3 bullets on the customer pain and why it matters now.
+
+**Solution & Secret Sauce**
+1–3 bullets on how the product solves the pain plus any moat (tech, data, GTM edge).
+
+**Team & Origins**
+1–3 bullets on founders' backgrounds, prior wins, and fit for the problem.
+
+**Early Traction / Metrics**
+Key figures shared: users, revenue run-rate, retention, burn/runway, pilots, etc.
+
+**Fundraising Status**
+Round type, target size, amount committed, valuation guidance, timing.
+
+**Strategic Questions / Risks**
+Open issues, competitive threats, or areas where founders seek advice.
+
+**Next Steps & Owners**
+Bullet list of concrete follow-ups with owner + due date (e.g., "Send product deck – CEO, by Fri").
+
+STYLE RULES:
+- Concise: ~1–3 bullets per header; Meeting Snapshot is one line
+- Verbatim accuracy: never invent data; use "— not covered —" for missing sections
+- Investor tone: neutral, analytical, present tense ("Company reports 30% MoM growth")
+- Numbers first: prefer precise metrics ("$250k ARR") over qualitative adjectives
+- Omit pleasantries, small talk, and off-topic banter
+- Use the exact header titles above with ** for bold
+- No extra commentary outside the specified sections
 
 Transcript:
 ${transcriptText.substring(0, 15000)}`; // Limit to prevent token overflow
@@ -263,16 +294,45 @@ ${transcriptText.substring(0, 15000)}`; // Limit to prevent token overflow
  * Generate summary using OpenAI Responses API
  */
 async function generateOpenAISummary(transcriptText, apiKey) {
-  const prompt = `You are a helpful assistant that summarizes Hebrew conversation transcripts.
+  const prompt = `You are Startup-Meeting GPT, a neutral, analytical note-taker for early-stage tech investors. Your input is a verbatim meeting transcript; your output is a short, structured summary capturing problem/solution fit, team quality, traction, fundraising status, risks, and explicit next steps.
 
-Please provide a concise summary of the following Hebrew conversation transcript. 
-Include:
-1. Main topics discussed
-2. Key points or decisions made
-3. Any action items or follow-ups mentioned
-4. Overall tone and context of the conversation
+REQUIRED OUTPUT HEADERS (use exactly these titles):
 
-Keep the summary to about 1-3 paragraphs.
+**Meeting Snapshot**
+One line – date, attendees, and purpose (e.g., "2025-07-15 · Jane Doe & Team ▸ Intro call").
+
+**Startup in One Sentence**
+Plain-English elevator pitch, ≤ 30 words.
+
+**Problem & Current Pain**
+1–3 bullets on the customer pain and why it matters now.
+
+**Solution & Secret Sauce**
+1–3 bullets on how the product solves the pain plus any moat (tech, data, GTM edge).
+
+**Team & Origins**
+1–3 bullets on founders' backgrounds, prior wins, and fit for the problem.
+
+**Early Traction / Metrics**
+Key figures shared: users, revenue run-rate, retention, burn/runway, pilots, etc.
+
+**Fundraising Status**
+Round type, target size, amount committed, valuation guidance, timing.
+
+**Strategic Questions / Risks**
+Open issues, competitive threats, or areas where founders seek advice.
+
+**Next Steps & Owners**
+Bullet list of concrete follow-ups with owner + due date (e.g., "Send product deck – CEO, by Fri").
+
+STYLE RULES:
+- Concise: ~1–3 bullets per header; Meeting Snapshot is one line
+- Verbatim accuracy: never invent data; use "— not covered —" for missing sections
+- Investor tone: neutral, analytical, present tense ("Company reports 30% MoM growth")
+- Numbers first: prefer precise metrics ("$250k ARR") over qualitative adjectives
+- Omit pleasantries, small talk, and off-topic banter
+- Use the exact header titles above with ** for bold
+- No extra commentary outside the specified sections
 
 Transcript:
 ${transcriptText.substring(0, 15000)}`; // Limit to prevent token overflow
@@ -346,11 +406,25 @@ function formatAISummary(summary) {
     return '<p style="text-align: center; color: #666;">AI summary not available. See attached files for full transcript.</p>';
   }
 
-  // Convert markdown-style formatting to HTML
-  const htmlSummary = summary
+  // Convert markdown-style formatting to HTML with proper structure
+  let htmlSummary = summary
+    // Convert headers (** text **)
+    .replace(/\*\*(.+?)\*\*/g, '<h4 style="font-family: \'Poppins\', sans-serif; font-weight: 700; font-size: 16px; color: #143A39; margin: 20px 0 10px 0; border-bottom: 1px solid #FF8780; padding-bottom: 5px;">$1</h4>')
+    // Convert bullet points
+    .replace(/^• (.+)$/gm, '<li style="margin: 8px 0; color: #143A39;">$1</li>')
+    .replace(/^- (.+)$/gm, '<li style="margin: 8px 0; color: #143A39;">$1</li>')
+    // Wrap consecutive <li> elements in <ul>
+    .replace(/(<li[^>]*>.*?<\/li>\s*)+/g, '<ul style="margin: 0 0 15px 0; padding-left: 20px;">$&</ul>')
+    // Convert line breaks to paragraphs for non-list content
     .split('\n\n')
-    .map(paragraph => `<p style="margin-bottom: 15px; line-height: 1.6;">${paragraph.trim()}</p>`)
-    .join('');
+    .map(block => {
+      // Don't wrap headers or lists in paragraphs
+      if (block.includes('<h4') || block.includes('<ul') || block.trim() === '') {
+        return block;
+      }
+      return `<p style="margin-bottom: 15px; line-height: 1.6; color: #143A39;">${block.trim()}</p>`;
+    })
+    .join('\n');
 
   return htmlSummary;
 }
@@ -413,7 +487,7 @@ exports.handler = async (event) => {
     }
     
     // Create email content
-    const subject = `Hebrew Transcription Complete: ${filename}`;
+    const subject = `Meeting Transcription Complete: ${filename}`;
     
     const htmlBody = `
 <!DOCTYPE html>
@@ -572,8 +646,8 @@ exports.handler = async (event) => {
 <body>
   <div class="container">
     <div class="header">
-      <h1>Hebrew Transcription Complete</h1>
-      <p>Your audio has been successfully processed</p>
+      <h1>Meeting Transcription Complete</h1>
+      <p>Your startup meeting has been analyzed</p>
     </div>
     <div class="coral-bar"></div>
     <div class="content">
@@ -591,7 +665,7 @@ exports.handler = async (event) => {
       ${attachmentNote ? `<div class="info-box">${attachmentNote}</div>` : ''}
       
       <div class="summary-box">
-        <h3>AI Summary</h3>
+        <h3>Meeting Summary</h3>
         <div class="summary-content">
           ${formattedSummary}
         </div>
@@ -608,26 +682,26 @@ exports.handler = async (event) => {
     
     <div class="footer">
       <div class="logo">Square Peg</div>
-      <p>Hebrew Transcription Pipeline</p>
+      <p>Meeting Transcription Pipeline</p>
       <p style="font-size: 12px; opacity: 0.8;">This is an automated message</p>
     </div>
   </div>
 </body>
 </html>`;
     
-    const textBody = `Hebrew Transcription Complete
+    const textBody = `Meeting Transcription Complete
 
 File: ${filename}
 Processing Time: ${formatDuration(processingTime || 0)}
 
-The transcription has been completed successfully.
+The startup meeting transcription and analysis has been completed successfully.
 
 ${attachments.length > 0 ? 'Please see the attached files for the full transcript.' : 
   `Download the transcript files from:
 - Text: ${txtUrl}
 - JSON: ${jsonUrl}`}
 
-This is an automated message from the Hebrew Transcription Pipeline.`;
+This is an automated message from the Meeting Transcription Pipeline.`;
     
     // Create and send email
     const mimeEmail = createMimeEmail(fromEmail, recipients, subject, htmlBody, textBody, attachments);
